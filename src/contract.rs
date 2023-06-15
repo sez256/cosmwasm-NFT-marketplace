@@ -1,15 +1,21 @@
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
-use cosmwasm_std::{Binary, Deps, DepsMut, Env, MessageInfo, Response, StdResult};
+use cosmwasm_std::{Binary, Deps, DepsMut, Env, MessageInfo, StdResult};
 // use cw2::set_contract_version;
 
 use crate::error::ContractError;
 use crate::msg::{AskHookMsg, ExecuteMsg, HookAction, InstantiateMsg, QueryMsg};
-use crate::state::{ask_key, asks, Ask, SaleType, TokenId, ASK_HOOKS};
-use cosmwasm_std::{Addr, Coin, Empty, Event, Storage, Timestamp, Uint128, WasmMsg};
+use crate::state::{
+    ask_key, asks, bid_key, bids, Ask, Order, SaleType, SudoParams, TokenId, ASK_HOOKS, SUDO_PARAMS,
+};
+use core::num::bignum::Big32x40;
+use cosmwasm_std::{
+    coin, Addr, BankMsg, Coin, Decimal, Empty, Event, StdError, Storage, Timestamp, Uint128,
+    WasmMsg,
+};
 use cw721_base::helpers::Cw721Contract;
-use cw_utils::may_pay;
-use sg_std::SubMsg;
+use cw_utils::{may_pay, maybe_addr, must_pay};
+use sg_std::{Response, SubMsg};
 use std::marker::PhantomData;
 
 pub const NATIVE_DENOM: &str = "CMDX";
@@ -39,6 +45,14 @@ pub struct NFTinfo {
     reserve_for: Option<Addr>,
     finders_fee_bps: Option<u64>,
     expires: Timestamp,
+}
+
+pub struct BidInfo {
+    collection: Addr,
+    token_id: TokenId,
+    expires: Timestamp,
+    finder: Option<Addr>,
+    finders_fee_bps: Option<u64>,
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
@@ -74,6 +88,27 @@ pub fn execute(
                 finders_fee_bps,
                 expires,
             },
+        ),
+        ExecuteMsg::SetBid {
+            collection,
+            token_id,
+            expires,
+            finder,
+            finders_fee_bps,
+            sale_type,
+        } => execute_set_bid(
+            deps,
+            env,
+            info,
+            sale_type,
+            BidInfo {
+                collection: api.addr_validate(&collection)?,
+                token_id,
+                expires,
+                finder: maybe_addr(api, finder)?,
+                finders_fee_bps,
+            },
+            false,
         ),
     }
 }
@@ -182,6 +217,157 @@ fn prepare_ask_hook(deps: Deps, ask: &Ask, action: HookAction) -> StdResult<Vec<
 
     Ok(submsgs)
 }
+enum HookReply {
+    Ask = 1,
+    Sale,
+    Bid,
+    CollectionBid,
+}
+
+impl From<u64> for HookReply {
+    fn from(item: u64) -> Self {
+        match item {
+            1 => HookReply::Ask,
+            2 => HookReply::Sale,
+            3 => HookReply::Bid,
+            4 => HookReply::CollectionBid,
+            _ => panic!("invalid reply type"),
+        }
+    }
+}
+
+pub fn execute_set_bid(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    sale_type: SaleType,
+    bid_info: BidInfo,
+    buy_now: bool,
+) -> Result<Response, ContractError> {
+    let BidInfo {
+        collection,
+        token_id,
+        finders_fee_bps,
+        expires,
+        finder,
+    } = bid_info;
+    let params = SUDO_PARAMS.load(deps.storage)?;
+
+    if let Some(finder) = finder.clone() {
+        if info.sender == finder {
+            return Err(ContractError::InvalidFinder(
+                "bidder cannot be finder".to_string(),
+            ));
+        }
+    }
+    let bid_price = must_pay(&info, NATIVE_DENOM)?;
+    if bid_price < params.min_price {
+        return Err(ContractError::PriceTooSmall(bid_price));
+    }
+    params.bid_expiry.is_valid(&env.block, expires)?;
+    if let Some(finders_fee_bps) = finders_fee_bps {
+        if Decimal::percent(finders_fee_bps) > params.max_finders_fee_percent {
+            return Err(ContractError::InvalidFindersFeeBps(finders_fee_bps));
+        }
+    }
+    let bidder = info.sender;
+    let mut res = Response::new();
+    let bid_key = bid_key(&collection, token_id, &bidder);
+    let ask_key = ask_key(&collection, token_id);
+
+    if let Some(existing_bid) = bids().may_load(deps.storage, bid_key.clone())? {
+        bids().remove(deps.storage, bid_key)?;
+        let refund_bidder = BankMsg::Send {
+            to_address: bidder.to_string(),
+            amount: vec![coin(existing_bid.price.u128(), NATIVE_DENOM)],
+        };
+        res = res.add_message(refund_bidder)
+    }
+    let existing_ask = asks().may_load(deps.storage, ask_key.clone())?;
+
+    if let Some(ask) = existing_ask.clone() {
+        if ask.is_expired(&env.block) {
+            return Err(ContractError::AskExpired {});
+        }
+        if !ask.is_active {
+            return Err(ContractError::AskNotActive {});
+        }
+        if let Some(reserved_for) = ask.reserve_for {
+            if reserved_for != bidder {
+                return Err(ContractError::TokenReserved {});
+            }
+        }
+    } else if buy_now {
+        return Err(ContractError::ItemNotForSale {});
+    }
+    let save_bid = |store| -> StdResult<_> {
+        let bid = Bid::new(
+            collection.clone(),
+            token_id,
+            bidder.clone(),
+            bid_price,
+            finders_fee_bps,
+            expires,
+        );
+        store_bid(store, &bid)?;
+        Ok(Some(bid))
+    };
+
+    let bid = match existing_ask {
+        Some(ask) => match ask.sale_type {
+            SaleType::FixedPrice => {
+                // check if bid matches ask price then execute the sale
+                // if the bid is lower than the ask price save the bid
+                // otherwise return an error
+                match bid_price.cmp(&ask.price) {
+                    Ordering::Greater => {
+                        return Err(ContractError::InvalidPrice {});
+                    }
+                    Ordering::Less => save_bid(deps.storage)?,
+                    Ordering::Equal => {
+                        asks().remove(deps.storage, ask_key)?;
+                        let owner = match Cw721Contract::<Empty, Empty>(
+                            ask.collection.clone(),
+                            PhantomData,
+                            PhantomData,
+                        )
+                        .owner_of(
+                            &deps.querier,
+                            ask.token_id.to_string(),
+                            false,
+                        ) {
+                            Ok(res) => res.owner,
+                            Err(_) => return Err(ContractError::InvalidListing {}),
+                        };
+                        if ask.seller != owner {
+                            return Err(ContractError::InvalidListing {});
+                        }
+                        finalize_sale(
+                            deps.as_ref(),
+                            ask,
+                            bid_price,
+                            bidder.clone(),
+                            finder,
+                            &mut res,
+                        )?;
+                        None
+                    }
+                }
+            }
+            SaleType::Auction => {
+                // check if bid price is equal or greater than ask price then place the bid
+                // otherwise return an error
+                match bid_price.cmp(&ask.price) {
+                    Ordering::Greater => save_bid(deps.storage)?,
+                    Ordering::Equal => save_bid(deps.storage)?,
+                    Ordering::Less => {
+                        return Err(ContractError::InvalidPrice {});
+                    }
+                }
+            }
+        },
+        None => save_bid(deps.storage)?,
+}}
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn query(_deps: Deps, _env: Env, _msg: QueryMsg) -> StdResult<Binary> {

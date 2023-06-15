@@ -17,6 +17,14 @@ pub enum ExecuteMsg {
         finders_fee_bps: Option<u64>,
         expires: Timestamp,
     },
+    SetBid {
+        collection: String,
+        token_id: TokenId,
+        expires: Timestamp,
+        sale_type: SaleType,
+        finder: Option<String>,
+        finders_fee_bps: Option<u64>,
+    },
 }
 
 #[cw_serde]
