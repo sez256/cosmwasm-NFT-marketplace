@@ -10,11 +10,13 @@ use crate::state::{
     SUDO_PARAMS,
 };
 use cosmwasm_std::{
-    coin, Addr, BankMsg, Coin, Decimal, Empty, Event, StdError, Storage, Timestamp, Uint128,
-    WasmMsg,
+    coin, Addr, BankMsg, BlockInfo, Coin, Decimal, Empty, Event, StdError, Storage, Timestamp,
+    Uint128, WasmMsg,
 };
+use cw721::{Cw721ExecuteMsg, OwnerOfResponse};
 use cw721_base::helpers::Cw721Contract;
-use cw_utils::{may_pay, maybe_addr, must_pay};
+use cw_utils::{may_pay, maybe_addr, must_pay, nonpayable};
+use sg721_base::msg::{CollectionInfoResponse, QueryMsg as Sg721QueryMsg};
 use sg_std::{Response, SubMsg};
 use std::cmp::Ordering;
 use std::marker::PhantomData;
@@ -110,6 +112,40 @@ pub fn execute(
                 finders_fee_bps,
             },
             false,
+        ),
+        ExecuteMsg::BuyNow {
+            collection,
+            token_id,
+            expires,
+            finder,
+            finders_fee_bps,
+        } => execute_set_bid(
+            deps,
+            env,
+            info,
+            SaleType::FixedPrice,
+            BidInfo {
+                collection: api.addr_validate(&collection)?,
+                token_id,
+                expires,
+                finder: maybe_addr(api, finder)?,
+                finders_fee_bps,
+            },
+            true,
+        ),
+        ExecuteMsg::AcceptBid {
+            collection,
+            token_id,
+            bidder,
+            finder,
+        } => execute_accept_bid(
+            deps,
+            env,
+            info,
+            api.addr_validate(&collection)?,
+            token_id,
+            api.addr_validate(&bidder)?,
+            maybe_addr(api, finder)?,
         ),
     }
 }
@@ -452,6 +488,107 @@ fn prepare_bid_hook(deps: Deps, bid: &Bid, action: HookAction) -> StdResult<Vec<
     })?;
 
     Ok(submsgs)
+}
+
+/// Seller can accept a bid which transfers funds as well as the token. The bid may or may not be associated with an ask.
+pub fn execute_accept_bid(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    collection: Addr,
+    token_id: TokenId,
+    bidder: Addr,
+    finder: Option<Addr>,
+) -> Result<Response, ContractError> {
+    nonpayable(&info)?;
+    only_owner(deps.as_ref(), &info, &collection, token_id)?;
+    only_tradable(deps.as_ref(), &env.block, &collection)?;
+    let bid_key = bid_key(&collection, token_id, &bidder);
+    let ask_key = ask_key(&collection, token_id);
+
+    let bid = bids().load(deps.storage, bid_key.clone())?;
+    if bid.is_expired(&env.block) {
+        return Err(ContractError::BidExpired {});
+    }
+
+    if asks().may_load(deps.storage, ask_key.clone())?.is_some() {
+        asks().remove(deps.storage, ask_key)?;
+    }
+
+    // Create a temporary Ask
+    let ask = Ask {
+        sale_type: SaleType::Auction,
+        collection: collection.clone(),
+        token_id,
+        price: bid.price,
+        expires_at: bid.expires_at,
+        is_active: true,
+        seller: info.sender.clone(),
+        funds_recipient: Some(info.sender),
+        reserve_for: None,
+        finders_fee_bps: bid.finders_fee_bps,
+    };
+
+    // Remove accepted bid
+    bids().remove(deps.storage, bid_key)?;
+
+    let mut res = Response::new();
+
+    // Transfer funds and NFT
+    finalize_sale(
+        deps.as_ref(),
+        ask,
+        bid.price,
+        bidder.clone(),
+        finder,
+        &mut res,
+    )?;
+
+    let event = Event::new("accept-bid")
+        .add_attribute("collection", collection.to_string())
+        .add_attribute("token_id", token_id.to_string())
+        .add_attribute("bidder", bidder)
+        .add_attribute("price", bid.price.to_string());
+
+    Ok(res.add_event(event))
+}
+
+fn only_owner(
+    deps: Deps,
+    info: &MessageInfo,
+    collection: &Addr,
+    token_id: u32,
+) -> Result<OwnerOfResponse, ContractError> {
+    let res = Cw721Contract::<Empty, Empty>(collection.clone(), PhantomData, PhantomData)
+        .owner_of(&deps.querier, token_id.to_string(), false)?;
+    if res.owner != info.sender {
+        return Err(ContractError::UnauthorizedOwner {});
+    }
+
+    Ok(res)
+}
+
+/// Checks that the collection is tradable
+fn only_tradable(deps: Deps, block: &BlockInfo, collection: &Addr) -> Result<bool, ContractError> {
+    let res: Result<CollectionInfoResponse, StdError> = deps
+        .querier
+        .query_wasm_smart(collection.clone(), &Sg721QueryMsg::CollectionInfo {});
+
+    match res {
+        Ok(collection_info) => match collection_info.start_trading_time {
+            Some(start_trading_time) => {
+                if start_trading_time > block.time {
+                    Err(ContractError::CollectionNotTradable {})
+                } else {
+                    Ok(true)
+                }
+            }
+            // not set by collection, so tradable
+            None => Ok(true),
+        },
+        // not supported by collection
+        Err(_) => Ok(true),
+    }
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]

@@ -25,6 +25,19 @@ pub enum ExecuteMsg {
         finder: Option<String>,
         finders_fee_bps: Option<u64>,
     },
+    BuyNow {
+        collection: String,
+        token_id: TokenId,
+        expires: Timestamp,
+        finder: Option<String>,
+        finders_fee_bps: Option<u64>,
+    },
+    AcceptBid {
+        collection: String,
+        token_id: TokenId,
+        bidder: String,
+        finder: Option<String>,
+    },
 }
 
 #[cw_serde]

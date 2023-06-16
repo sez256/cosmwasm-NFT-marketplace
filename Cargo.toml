@@ -53,6 +53,7 @@ cw721 = "0.17.0"
 cw-utils = "1.0.1"
 sg-controllers = "2.1.0"
 sg-std = "2.1.0"
+sg721-base = { version = "2.1.0", features = ["library"] }
 
 
 [dev-dependencies]
