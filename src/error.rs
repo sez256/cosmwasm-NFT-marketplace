@@ -17,4 +17,34 @@ pub enum ContractError {
 
     #[error("InvalidPrice")]
     InvalidPrice {},
+
+    #[error("InvalidFinder: {0}")]
+    InvalidFinder(String),
+
+    #[error("PriceTooSmall: {0}")]
+    PriceTooSmall(Uint128),
+
+    #[error("Invalid finders fee bps: {0}")]
+    InvalidFindersFeeBps(u64),
+
+    #[error("AskExpired")]
+    AskExpired {},
+
+    #[error("AskNotActive")]
+    AskNotActive {},
+
+    #[error("AskUnchanged")]
+    AskUnchanged {},
+
+    #[error("Token reserved")]
+    TokenReserved {},
+
+    #[error("Item not for sale")]
+    ItemNotForSale {},
+
+    #[error("InvalidListingFee: {0}")]
+    InvalidListingFee(Uint128),
+
+    #[error("InvalidListing/StaleListing")]
+    InvalidListing {},
 }
