@@ -47,4 +47,13 @@ pub enum ContractError {
 
     #[error("InvalidListing/StaleListing")]
     InvalidListing {},
+
+    #[error("BidExpired")]
+    BidExpired {},
+
+    #[error("UnauthorizedOwner")]
+    UnauthorizedOwner {},
+
+    #[error("Collection not tradable yet")]
+    CollectionNotTradable {},
 }

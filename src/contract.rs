@@ -4,18 +4,22 @@ use cosmwasm_std::{Binary, Deps, DepsMut, Env, MessageInfo, StdResult};
 // use cw2::set_contract_version;
 
 use crate::error::ContractError;
-use crate::msg::{AskHookMsg, ExecuteMsg, HookAction, InstantiateMsg, QueryMsg};
+use crate::msg::{
+    AskHookMsg, BidHookMsg, ExecuteMsg, HookAction, InstantiateMsg, QueryMsg, SaleHookMsg,
+};
 use crate::state::{
     ask_key, asks, bid_key, bids, Ask, Bid, Order, SaleType, SudoParams, TokenId, ASK_HOOKS,
-    SUDO_PARAMS,
+    BID_HOOKS, SALE_HOOKS, SUDO_PARAMS,
 };
 use cosmwasm_std::{
-    coin, Addr, BankMsg, BlockInfo, Coin, Decimal, Empty, Event, StdError, Storage, Timestamp,
-    Uint128, WasmMsg,
+    coin, to_binary, Addr, BankMsg, BlockInfo, Coin, Decimal, Empty, Event, StdError, Storage,
+    Timestamp, Uint128, WasmMsg,
 };
 use cw721::{Cw721ExecuteMsg, OwnerOfResponse};
 use cw721_base::helpers::Cw721Contract;
 use cw_utils::{may_pay, maybe_addr, must_pay, nonpayable};
+use sg1::fair_burn;
+use sg721::RoyaltyInfoResponse;
 use sg721_base::msg::{CollectionInfoResponse, QueryMsg as Sg721QueryMsg};
 use sg_std::{Response, SubMsg};
 use std::cmp::Ordering;
@@ -474,6 +478,116 @@ fn finalize_sale(
     res.events.push(event);
 
     Ok(())
+}
+/// Check royalties are non-zero
+fn parse_royalties(royalty_info: Option<RoyaltyInfoResponse>) -> Option<RoyaltyInfoResponse> {
+    match royalty_info {
+        Some(royalty) => {
+            if royalty.share.is_zero() {
+                return None;
+            }
+            Some(royalty)
+        }
+        None => None,
+    }
+}
+fn payout(
+    deps: Deps,
+    collection: Addr,
+    payment: Uint128,
+    payment_recipient: Addr,
+    finder: Option<Addr>,
+    finders_fee_bps: Option<u64>,
+    res: &mut Response,
+) -> StdResult<()> {
+    let params = SUDO_PARAMS.load(deps.storage)?;
+
+    // Append Fair Burn message
+    let network_fee = payment * params.trading_fee_percent / Uint128::from(100u128);
+    fair_burn(network_fee.u128(), None, res);
+
+    let collection_info: CollectionInfoResponse = deps
+        .querier
+        .query_wasm_smart(collection.clone(), &Sg721QueryMsg::CollectionInfo {})?;
+
+    let finders_fee = match finder {
+        Some(finder) => {
+            let finders_fee = finders_fee_bps
+                .map(|fee| (payment * Decimal::percent(fee) / Uint128::from(100u128)).u128())
+                .unwrap_or(0);
+            if finders_fee > 0 {
+                res.messages.push(SubMsg::new(BankMsg::Send {
+                    to_address: finder.to_string(),
+                    amount: vec![coin(finders_fee, NATIVE_DENOM)],
+                }));
+            }
+            finders_fee
+        }
+        None => 0,
+    };
+
+    match parse_royalties(collection_info.royalty_info) {
+        // If token supports royalties, payout shares to royalty recipient
+        Some(royalty) => {
+            let amount = coin((payment * royalty.share).u128(), NATIVE_DENOM);
+            if payment < (network_fee + Uint128::from(finders_fee) + amount.amount) {
+                return Err(StdError::generic_err("Fees exceed payment"));
+            }
+            res.messages.push(SubMsg::new(BankMsg::Send {
+                to_address: royalty.payment_address.to_string(),
+                amount: vec![amount.clone()],
+            }));
+            let event = Event::new("royalty-payout")
+                .add_attribute("collection", collection.to_string())
+                .add_attribute("amount", amount.to_string())
+                .add_attribute("recipient", royalty.payment_address.to_string());
+            res.events.push(event);
+            let seller_share_msg = BankMsg::Send {
+                to_address: payment_recipient.to_string(),
+                amount: vec![coin(
+                    (payment * (Decimal::one() - royalty.share) - network_fee).u128() - finders_fee,
+                    NATIVE_DENOM.to_string(),
+                )],
+            };
+            res.messages.push(SubMsg::new(seller_share_msg));
+        }
+        None => {
+            if payment < (network_fee + Uint128::from(finders_fee)) {
+                return Err(StdError::generic_err("Fees exceed payment"));
+            }
+            // If token doesn't support royalties, pay seller in full
+            let seller_share_msg = BankMsg::Send {
+                to_address: payment_recipient.to_string(),
+                amount: vec![coin(
+                    (payment - network_fee).u128() - finders_fee,
+                    NATIVE_DENOM.to_string(),
+                )],
+            };
+            res.messages.push(SubMsg::new(seller_share_msg));
+        }
+    }
+
+    Ok(())
+}
+
+fn prepare_sale_hook(deps: Deps, ask: &Ask, buyer: Addr) -> StdResult<Vec<SubMsg>> {
+    let submsgs = SALE_HOOKS.prepare_hooks(deps.storage, |h| {
+        let msg = SaleHookMsg {
+            collection: ask.collection.to_string(),
+            token_id: ask.token_id,
+            price: coin(ask.price.clone().u128(), NATIVE_DENOM),
+            seller: ask.seller.to_string(),
+            buyer: buyer.to_string(),
+        };
+        let execute = WasmMsg::Execute {
+            contract_addr: h.to_string(),
+            msg: msg.into_binary()?,
+            funds: vec![],
+        };
+        Ok(SubMsg::reply_on_error(execute, HookReply::Sale as u64))
+    })?;
+
+    Ok(submsgs)
 }
 
 fn prepare_bid_hook(deps: Deps, bid: &Bid, action: HookAction) -> StdResult<Vec<SubMsg>> {
