@@ -76,7 +76,11 @@ pub struct Ask {
     pub expires_at: Timestamp,
     pub is_active: bool,
 }
-
+impl Order for Ask {
+    fn expires_at(&self) -> Timestamp {
+        self.expires_at
+    }
+}
 /// Primary key for asks: (collection, token_id)
 pub type AskKey = (Addr, TokenId);
 /// Convenience ask key constructor

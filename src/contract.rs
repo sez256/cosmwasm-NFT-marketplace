@@ -6,9 +6,9 @@ use cosmwasm_std::{Binary, Deps, DepsMut, Env, MessageInfo, StdResult};
 use crate::error::ContractError;
 use crate::msg::{AskHookMsg, ExecuteMsg, HookAction, InstantiateMsg, QueryMsg};
 use crate::state::{
-    ask_key, asks, bid_key, bids, Ask, Order, SaleType, SudoParams, TokenId, ASK_HOOKS, SUDO_PARAMS,
+    ask_key, asks, bid_key, bids, Ask, Bid, Order, SaleType, SudoParams, TokenId, ASK_HOOKS,
+    SUDO_PARAMS,
 };
-use core::num::bignum::Big32x40;
 use cosmwasm_std::{
     coin, Addr, BankMsg, Coin, Decimal, Empty, Event, StdError, Storage, Timestamp, Uint128,
     WasmMsg,
@@ -16,6 +16,7 @@ use cosmwasm_std::{
 use cw721_base::helpers::Cw721Contract;
 use cw_utils::{may_pay, maybe_addr, must_pay};
 use sg_std::{Response, SubMsg};
+use std::cmp::Ordering;
 use std::marker::PhantomData;
 
 pub const NATIVE_DENOM: &str = "CMDX";
@@ -367,7 +368,91 @@ pub fn execute_set_bid(
             }
         },
         None => save_bid(deps.storage)?,
-}}
+    };
+    let hook = if let Some(bid) = bid {
+        prepare_bid_hook(deps.as_ref(), &bid, HookAction::Create)?
+    } else {
+        vec![]
+    };
+
+    let event = Event::new("set-bid")
+        .add_attribute("collection", collection.to_string())
+        .add_attribute("sale_type", sale_type.to_string())
+        .add_attribute("token_id", token_id.to_string())
+        .add_attribute("bidder", bidder)
+        .add_attribute("bid_price", bid_price.to_string())
+        .add_attribute("expires", expires.to_string());
+
+    Ok(res.add_submessages(hook).add_event(event))
+}
+
+fn store_bid(store: &mut dyn Storage, bid: &Bid) -> StdResult<()> {
+    bids().save(
+        store,
+        bid_key(&bid.collection, bid.token_id, &bid.bidder),
+        bid,
+    )
+}
+
+fn finalize_sale(
+    deps: Deps,
+    ask: Ask,
+    price: Uint128,
+    buyer: Addr,
+    finder: Option<Addr>,
+    res: &mut Response,
+) -> StdResult<()> {
+    payout(
+        deps,
+        ask.collection.clone(),
+        price,
+        ask.funds_recipient
+            .clone()
+            .unwrap_or_else(|| ask.seller.clone()),
+        finder,
+        ask.finders_fee_bps,
+        res,
+    )?;
+
+    let cw721_transfer_msg = Cw721ExecuteMsg::TransferNft {
+        token_id: ask.token_id.to_string(),
+        recipient: buyer.to_string(),
+    };
+
+    let exec_cw721_transfer = WasmMsg::Execute {
+        contract_addr: ask.collection.to_string(),
+        msg: to_binary(&cw721_transfer_msg)?,
+        funds: vec![],
+    };
+    res.messages.push(SubMsg::new(exec_cw721_transfer));
+
+    res.messages
+        .append(&mut prepare_sale_hook(deps, &ask, buyer.clone())?);
+
+    let event = Event::new("finalize-sale")
+        .add_attribute("collection", ask.collection.to_string())
+        .add_attribute("token_id", ask.token_id.to_string())
+        .add_attribute("seller", ask.seller.to_string())
+        .add_attribute("buyer", buyer.to_string())
+        .add_attribute("price", price.to_string());
+    res.events.push(event);
+
+    Ok(())
+}
+
+fn prepare_bid_hook(deps: Deps, bid: &Bid, action: HookAction) -> StdResult<Vec<SubMsg>> {
+    let submsgs = BID_HOOKS.prepare_hooks(deps.storage, |h| {
+        let msg = BidHookMsg { bid: bid.clone() };
+        let execute = WasmMsg::Execute {
+            contract_addr: h.to_string(),
+            msg: msg.into_binary(action.clone())?,
+            funds: vec![],
+        };
+        Ok(SubMsg::reply_on_error(execute, HookReply::Bid as u64))
+    })?;
+
+    Ok(submsgs)
+}
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn query(_deps: Deps, _env: Env, _msg: QueryMsg) -> StdResult<Binary> {
