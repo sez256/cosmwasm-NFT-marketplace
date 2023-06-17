@@ -1,6 +1,6 @@
 use cosmwasm_schema::cw_serde;
-use cosmwasm_std::{Addr, BlockInfo, Decimal, Timestamp, Uint128};
-use cw_storage_plus::{Index, IndexList, IndexedMap, Item, MultiIndex};
+use cosmwasm_std::{Addr, BlockInfo, Coin, Decimal, Timestamp, Uint128};
+use cw_storage_plus::{Index, IndexList, IndexedMap, Item, Map, MultiIndex};
 use cw_utils::Duration;
 use sg_controllers::Hooks;
 
@@ -218,3 +218,21 @@ pub fn bids<'a>() -> IndexedMap<'a, BidKey, Bid, BidIndicies<'a>> {
     };
     IndexedMap::new("bids", indexes)
 }
+
+#[cw_serde]
+pub struct TokenInfo {
+    pub owner: Addr,
+    pub base_price: Vec<Coin>,
+    pub token_uri: Option<String>,
+    pub token_id: u64,
+}
+pub const TOKENS: Map<u64, TokenInfo> = Map::new("tokens");
+
+#[cw_serde]
+pub struct State {
+    pub name: String,
+    pub symbol: String,
+    pub minter: Addr,
+    pub num_tokens: u64,
+}
+pub const CONFIG: Item<State> = Item::new("config");

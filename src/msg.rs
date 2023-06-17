@@ -125,6 +125,11 @@ impl SaleHookMsg {
         to_binary(&msg)
     }
 }
+pub struct MintMsg {
+    pub owner: String,
+    pub token_uri: Option<String>,
+    pub price: Vec<Coin>,
+}
 #[cw_serde]
 pub enum SaleExecuteMsg {
     SaleHook(SaleHookMsg),

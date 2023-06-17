@@ -1,14 +1,15 @@
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{Binary, Deps, DepsMut, Env, MessageInfo, StdResult};
+
 // use cw2::set_contract_version;
 
 use crate::error::ContractError;
 use crate::msg::{
-    AskHookMsg, BidHookMsg, ExecuteMsg, HookAction, InstantiateMsg, QueryMsg, SaleHookMsg,
+    AskHookMsg, BidHookMsg,MintMsg, ExecuteMsg, HookAction, InstantiateMsg, QueryMsg, SaleHookMsg,
 };
 use crate::state::{
-    ask_key, asks, bid_key, bids, Ask, Bid, Order, SaleType, SudoParams, TokenId, ASK_HOOKS,
+    ask_key, asks, bid_key,TOKENS, bids,CONFIG ,Ask, Bid, State,Order, SaleType,TokenInfo ,SudoParams, TokenId, ASK_HOOKS,
     BID_HOOKS, SALE_HOOKS, SUDO_PARAMS,
 };
 use cosmwasm_std::{
@@ -42,6 +43,8 @@ pub fn instantiate(
 ) -> Result<Response, ContractError> {
     Ok(Response::new())
 }
+
+
 
 pub struct NFTinfo {
     sale_type: SaleType,
@@ -151,8 +154,58 @@ pub fn execute(
             api.addr_validate(&bidder)?,
             maybe_addr(api, finder)?,
         ),
+
+        ExecuteMsg::Mint {
+            token_name,
+            asset_description,
+            owner,
+            token_URL,
+        } => ,
     }
 }
+
+pub fn handle_mint(
+    deps: DepsMut,
+    _env: Env,
+    info: MessageInfo,
+    msg: MintMsg,
+) -> Result<Response, ContractError> {
+
+    let mut config = query_config(deps.as_ref())?;
+    
+    let num_tokens = config.num_tokens + 1;
+
+    let token = TokenInfo {
+        owner: deps.api.addr_validate(&msg.owner)?,
+        token_uri: msg.token_uri,
+        base_price: msg.price,
+        token_id: num_tokens,
+    };
+     
+    
+    TOKENS.save(deps.storage, num_tokens, &token)?;
+
+  
+    config.num_tokens = num_tokens;
+    CONFIG.save(deps.storage, &config)?;
+
+    Ok(Response::new()
+        .add_attribute("action", "mint")
+        .add_attribute("from", info.sender)
+        .add_attribute("owner", msg.owner)
+        .add_attribute("token_id", num_tokens.to_string()))
+}
+
+pub fn query_config(deps: Deps) -> StdResult<State> {
+    let res = CONFIG.may_load(deps.storage)?;
+    match res {
+        Some(val) => Ok(val),
+        None => Err(StdError::GenericErr {
+            msg: String::from("Unable to load internal state"),
+        }),
+    }
+}
+
 
 pub fn execute_set_ask(
     deps: DepsMut,
